@@ -22,20 +22,30 @@ import { badCredentials, notFound, readBody, sendJson } from './webutil.ts';
 
 // ---------------------------------------------------------------- helpers ---
 
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+// The request URL is parsed once and memoised on the request object: the
+// dispatcher and the REST handler both need the path and the query of every
+// request, and re-parsing the same string was pure overhead on hot routes.
+const urlMemo = new WeakMap<IncomingMessage, URL>();
+
+function urlOf(req: IncomingMessage): URL {
+  let url = urlMemo.get(req);
+  if (url === undefined) {
+    try {
+      url = new URL(req.url ?? '/', 'http://entry');
+    } catch {
+      url = new URL('/', 'http://entry');
+    }
+    urlMemo.set(req, url);
   }
+  return url;
+}
+
+function pathOf(req: IncomingMessage): string {
+  return urlOf(req).pathname;
 }
 
 function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  return urlOf(req).searchParams;
 }
 
 function commitJson(req: IncomingMessage, repo: Repo, sha: string, withFiles: boolean): Record<string, unknown> | undefined {

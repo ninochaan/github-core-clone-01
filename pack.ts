@@ -16,9 +16,10 @@ const TYPE_NUMBERS: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 
 
 export function pktLine(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const length = body.length + 4;
-  const header = length.toString(16).padStart(4, '0');
-  return Buffer.concat([Buffer.from(header, 'ascii'), body]);
+  const out = Buffer.allocUnsafe(body.length + 4);
+  out.write((body.length + 4).toString(16).padStart(4, '0'), 0, 'ascii');
+  body.copy(out, 4);
+  return out;
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');
@@ -100,11 +101,15 @@ function adler32(data: Buffer): number {
  * many bytes it consumed. inflateSync succeeds on any buffer that holds the
  * whole stream (trailing bytes are ignored) and throws on a truncated one,
  * so one full inflate yields the data; the stream's last four bytes are the
- * adler32 of that data, and locating the trailer pins the consumed length
- * (verified by an exact-length inflate). A binary search over the remainder
- * remains as a fallback for any stream the trailer scan cannot pin.
+ * adler32 of that data, and locating the trailer pins the consumed length.
+ * In strict mode each candidate position is verified by an exact-length
+ * inflate; in fast mode the first candidate is trusted and the caller
+ * (parsePack) validates the parse as a whole — it must land exactly on the
+ * pack trailer with every entry's size matching — and reparses strictly on
+ * any inconsistency. A binary search over the remainder remains as a
+ * fallback for any stream the trailer scan cannot pin.
  */
-function inflateOne(buf: Buffer, offset: number): { data: Buffer; consumed: number } {
+function inflateOne(buf: Buffer, offset: number, strict: boolean): { data: Buffer; consumed: number } {
   const rest = buf.subarray(offset);
   const data = inflateSync(rest);
   const trailer = Buffer.alloc(4);
@@ -114,6 +119,7 @@ function inflateOne(buf: Buffer, offset: number): { data: Buffer; consumed: numb
     const at = rest.indexOf(trailer, from);
     if (at === -1) break;
     const consumed = at + 4;
+    if (!strict) return { data, consumed };
     try {
       const check = inflateSync(rest.subarray(0, consumed));
       if (check.length === data.length && check.equals(data)) return { data, consumed };
@@ -196,8 +202,25 @@ export interface ParsedPack {
 /**
  * Parse a packfile into the object store, resolving deltas. Returns the new
  * objects' SHAs in pack order. Throws on any structural problem.
+ *
+ * The parse runs twice at most: a fast pass that trusts each zlib stream's
+ * first adler-trailer candidate for its length (saving one full inflate per
+ * entry), then — only when the fast pass throws or does not land exactly on
+ * the pack trailer — a strict pass that verifies every candidate by an
+ * exact-length inflate, exactly as the original parser did. A pack is
+ * accepted only by a pass whose every check holds, so the accepted results
+ * are the strict parser's; the fast pass is purely an accelerator for the
+ * well-formed packs real clients send.
  */
 export function parsePack(pack: Buffer): ParsedPack {
+  try {
+    return parsePackMode(pack, false);
+  } catch {
+    return parsePackMode(pack, true);
+  }
+}
+
+function parsePackMode(pack: Buffer, strict: boolean): ParsedPack {
   if (pack.length < 12 + 20) throw new Error('pack too short');
   if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack header missing');
   const version = pack.readUInt32BE(4);
@@ -249,7 +272,7 @@ export function parsePack(pack: Buffer): ParsedPack {
       baseSha = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
     }
-    const { data, consumed } = inflateOne(pack, offset);
+    const { data, consumed } = inflateOne(pack, offset, strict);
     if (data.length !== size) throw new Error('pack entry size mismatch');
     offset += consumed;
     byOffset.set(start, entries.length);
@@ -262,6 +285,11 @@ export function parsePack(pack: Buffer): ParsedPack {
       entries.push({ type, data, start });
     }
   }
+  // The fast pass trusted its stream boundaries: accept its parse only when
+  // it consumed the pack exactly, ending where the trailer begins. Anything
+  // else means a trailer candidate was coincidental, and the strict pass
+  // (which verifies every boundary) decides instead.
+  if (!strict && offset !== pack.length - 20) throw new Error('pack entries do not end at the trailer');
 
   // Resolve entries in order; a delta's base always precedes it in the pack
   // (ofs) or already lives in the store or this pack (ref).

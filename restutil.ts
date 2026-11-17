@@ -11,13 +11,24 @@ export function baseUrl(req: IncomingMessage): string {
   return `http://${host}`;
 }
 
+const nodeIdCache = new Map<string, string>();
+
 export function nodeId(kind: string, id: number): string {
-  // GitHub's legacy node id scheme: base64 of "<prefix>:<Kind><id>".
-  const prefixes: Record<string, string> = {
-    User: '04', Repository: '07', Issue: '05', PullRequest: '09', Label: '06', IssueComment: '03',
-  };
-  const prefix = prefixes[kind] ?? '00';
-  return Buffer.from(`${prefix}:${kind}${id}`, 'utf8').toString('base64');
+  // GitHub's legacy node id scheme: base64 of "<prefix>:<Kind><id>". The
+  // mapping is a pure function of (kind, id), so memoise it: hot JSON
+  // builders ask for the same ids on every request.
+  const key = `${kind}:${id}`;
+  let cached = nodeIdCache.get(key);
+  if (cached === undefined) {
+    const prefixes: Record<string, string> = {
+      User: '04', Repository: '07', Issue: '05', PullRequest: '09', Label: '06', IssueComment: '03',
+    };
+    const prefix = prefixes[kind] ?? '00';
+    cached = Buffer.from(`${prefix}:${kind}${id}`, 'utf8').toString('base64');
+    if (nodeIdCache.size >= 4096) nodeIdCache.clear();
+    nodeIdCache.set(key, cached);
+  }
+  return cached;
 }
 
 export function userJson(req: IncomingMessage, user: ScenarioUser | typeof VIEWER): Record<string, unknown> {
