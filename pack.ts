@@ -78,15 +78,50 @@ export class PktReader {
 
 // ----------------------------------------------------------------- packs ---
 
+/** Adler-32 of `data`, as the zlib trailer stores it. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(i + 5552, data.length);
+    for (; i < end; i += 1) {
+      a += data[i];
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /**
  * Inflate one zlib stream out of `buf` starting at `offset`, reporting how
  * many bytes it consumed. inflateSync succeeds on any buffer that holds the
  * whole stream (trailing bytes are ignored) and throws on a truncated one,
- * so the consumed length is the smallest prefix that inflates — a binary
- * search over the remainder finds it exactly.
+ * so one full inflate yields the data; the stream's last four bytes are the
+ * adler32 of that data, and locating the trailer pins the consumed length
+ * (verified by an exact-length inflate). A binary search over the remainder
+ * remains as a fallback for any stream the trailer scan cannot pin.
  */
 function inflateOne(buf: Buffer, offset: number): { data: Buffer; consumed: number } {
   const rest = buf.subarray(offset);
+  const data = inflateSync(rest);
+  const trailer = Buffer.alloc(4);
+  trailer.writeUInt32BE(adler32(data), 0);
+  let from = 0;
+  for (;;) {
+    const at = rest.indexOf(trailer, from);
+    if (at === -1) break;
+    const consumed = at + 4;
+    try {
+      const check = inflateSync(rest.subarray(0, consumed));
+      if (check.length === data.length && check.equals(data)) return { data, consumed };
+    } catch {
+      // A coincidental trailer match inside the stream: keep looking.
+    }
+    from = at + 1;
+  }
   let lo = 1;
   let hi = rest.length;
   while (lo < hi) {
@@ -273,8 +308,19 @@ export function parsePack(pack: Buffer): ParsedPack {
   return { count, shas };
 }
 
+/**
+ * Built packs are a pure function of their object list — the store is
+ * append-only and deflate is deterministic — and fetch workloads ask for the
+ * same pack repeatedly (every shallow clone of a repository wants the same
+ * tip closure), so memoise the last few dozen packs by their sha list.
+ */
+const packCache = new Map<string, Buffer>();
+
 /** Build a packfile holding exactly `shas` (plain objects, no deltas). */
 export function buildPack(shas: string[]): Buffer {
+  const key = shas.join(' ');
+  const cached = packCache.get(key);
+  if (cached) return cached;
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
@@ -302,5 +348,8 @@ export function buildPack(shas: string[]): Buffer {
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (packCache.size >= 64) packCache.clear();
+  packCache.set(key, pack);
+  return pack;
 }
